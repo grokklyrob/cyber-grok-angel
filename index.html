@@ -227,8 +227,9 @@
     0.05,
     100
   );
-  const DEFAULT_CAM_POS = new THREE.Vector3(3.4, 1.7, 4.2);
-  const DEFAULT_TARGET = new THREE.Vector3(0, 1.15, 0);
+  // Defaults updated after the model loads (fit-to-frame)
+  const DEFAULT_CAM_POS = new THREE.Vector3(0, 1.2, 7.5);
+  const DEFAULT_TARGET = new THREE.Vector3(0, 1.0, 0);
   camera.position.copy(DEFAULT_CAM_POS);
 
   // Full free orbit (omni-directional)
@@ -236,8 +237,8 @@
   controls.enableDamping = true;
   controls.dampingFactor = 0.06;
   controls.enablePan = true;
-  controls.minDistance = 1.6;
-  controls.maxDistance = 12;
+  controls.minDistance = 1.2;
+  controls.maxDistance = 18;
   controls.target.copy(DEFAULT_TARGET);
   // No polar angle lock → full free rotation in any direction
   controls.minPolarAngle = 0;
@@ -387,13 +388,8 @@
     (gltf) => {
       modelRoot = gltf.scene;
 
-      // Center / frame model gently
-      const box = new THREE.Box3().setFromObject(modelRoot);
-      const size = box.getSize(new THREE.Vector3());
-      const center = box.getCenter(new THREE.Vector3());
-      modelRoot.position.sub(center); // center at origin
-      // lift so feet near origin
-      modelRoot.position.y += size.y * 0.5;
+      // 33% smaller (scale 0.67), true-center, then fit camera so full model is visible
+      modelRoot.scale.setScalar(0.67);
 
       // Soften any overly harsh materials from export (gentle emission clamp)
       modelRoot.traverse((obj) => {
@@ -414,6 +410,32 @@
       });
 
       scene.add(modelRoot);
+
+      // Bounds after scale (must be after scene graph is ready)
+      modelRoot.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(modelRoot);
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+
+      // Center model on origin so page/orbit focus is true middle
+      modelRoot.position.x -= center.x;
+      modelRoot.position.y -= center.y;
+      modelRoot.position.z -= center.z;
+      modelRoot.updateMatrixWorld(true);
+
+      // Orbit target = visual center (origin after centering)
+      const targetY = 0;
+      controls.target.set(0, targetY, 0);
+      DEFAULT_TARGET.set(0, targetY, 0);
+
+      // Fit full model in view with margin (halo / wings not clipped)
+      const maxDim = Math.max(size.x, size.y, size.z, 0.001);
+      const fov = camera.fov * (Math.PI / 180);
+      const fitDist = maxDim / (2 * Math.tan(fov / 2));
+      const distance = fitDist * 1.45;
+      camera.position.set(distance * 0.55, targetY + maxDim * 0.08, distance * 0.9);
+      DEFAULT_CAM_POS.copy(camera.position);
+      controls.update();
 
       if (gltf.animations && gltf.animations.length) {
         mixer = new THREE.AnimationMixer(modelRoot);
