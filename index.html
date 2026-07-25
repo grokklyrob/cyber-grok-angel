@@ -21,7 +21,7 @@
       • Drag  — free omni-directional orbit
       • Scroll — zoom
       • Right-drag / two-finger — pan
-      • UI buttons — reset, play/pause animation, particles on/off
+      • UI buttons — reset camera, particles on/off
     ============================================================
   -->
   <style>
@@ -149,7 +149,6 @@
 
   <div class="ui">
     <button type="button" id="btn-reset" title="Reset camera">Reset</button>
-    <button type="button" id="btn-anim" class="active" title="Play / pause baked animation">Pause</button>
     <button type="button" id="btn-particles" class="active" title="Toggle particle field">Particles</button>
   </div>
 
@@ -181,7 +180,6 @@
   const wrap = document.getElementById("canvas-wrap");
   const statusEl = document.getElementById("status");
   const btnReset = document.getElementById("btn-reset");
-  const btnAnim = document.getElementById("btn-anim");
   const btnParticles = document.getElementById("btn-particles");
 
   // ---------- Renderer / scene ----------
@@ -262,7 +260,7 @@
   composer.addPass(new OutputPass());
 
   // ---------- Particle field (stardust motes) ----------
-  const PARTICLE_COUNT = 900;
+  const PARTICLE_COUNT = 1200;
   const particleGroup = new THREE.Group();
   scene.add(particleGroup);
 
@@ -336,11 +334,11 @@
   }
 
   const pMat = new THREE.PointsMaterial({
-    size: 0.08,
+    size: 0.1,
     map: makeSoftSprite(),
     vertexColors: true,
     transparent: true,
-    opacity: 0.75,
+    opacity: 0.85,
     depthWrite: false,
     blending: THREE.AdditiveBlending,
     sizeAttenuation: true,
@@ -350,16 +348,11 @@
   particleGroup.add(particles);
 
   // ---------- Model load ----------
-  // frame: scale + our centered spin (never uses GLB root pivot)
-  // model: geometry offset so body visual center == origin
+  // Static pose: centered, no rotation animation. Particles stay dynamic.
   let modelRoot = null;
-  let modelFrame = null;
-  let mixer = null; // unused; kept so Play/Pause UI stays simple
-  let animPlaying = true;
   let particlesOn = true;
-  let animTime = 0;
-  const ANIM_LOOP_SEC = 10;
   const clock = new THREE.Clock();
+  const ENLARGE = 1.33; // +33%
 
   // Skip far FX that pull the center off-axis / inflate fit distance
   const FX_RE = /star|shard|link|orbit|presence|tick|cable|rivet|datas/i;
@@ -411,19 +404,18 @@
         }
       });
 
-      // Reset any export transforms on the scene root before measuring
+      // Static pose — freeze any baked animation at rest
       model.position.set(0, 0, 0);
       model.rotation.set(0, 0, 0);
       model.scale.set(1, 1, 1);
       model.updateMatrixWorld(true);
 
-      // Measure body center in world space, then offset model so center is (0,0,0)
+      // Center body at origin
       let box = bodyBox(model);
       let center = box.getCenter(new THREE.Vector3());
       model.position.set(-center.x, -center.y, -center.z);
       model.updateMatrixWorld(true);
 
-      // Second measure after offset (catches nested pivots)
       box = bodyBox(model);
       center = box.getCenter(new THREE.Vector3());
       model.position.x -= center.x;
@@ -434,42 +426,39 @@
       box = bodyBox(model);
       const size = box.getSize(new THREE.Vector3());
 
-      // Frame owns scale + centered spin. Spin is applied HERE so pivot is always visual center.
       const frame = new THREE.Group();
       frame.add(model);
       scene.add(frame);
-      modelFrame = frame;
       modelRoot = frame;
 
-      // Fill ~55–60% of the shorter viewport axis
-      const maxDimLocal = Math.max(size.x, size.y, size.z, 0.001);
-      frame.scale.setScalar(1); // size driven by camera distance below
+      // +33% larger than fit-to-view baseline
+      frame.scale.setScalar(ENLARGE);
+      frame.rotation.set(0, 0, 0);
+      frame.position.set(0, 0, 0);
 
-      // Dead-center target
+      const maxDimLocal = Math.max(size.x, size.y, size.z, 0.001) * ENLARGE;
+
       controls.target.set(0, 0, 0);
       DEFAULT_TARGET.set(0, 0, 0);
 
-      // Fit body to view — front camera on +Z, no lateral offset (that was shifting composition)
+      // Front camera, dead center — no lateral offset, no model spin
       const fov = camera.fov * (Math.PI / 180);
       const aspect = camera.aspect;
-      // Use vertical FOV fit; if wide screen, also consider horizontal
       const fitH = maxDimLocal / (2 * Math.tan(fov / 2));
       const fitW = maxDimLocal / (2 * Math.tan(fov / 2) * aspect);
       const fitDist = Math.max(fitH, fitW);
-      // margin: 1.35 ⇒ body reads large but keeps wing tips in frame
-      const distance = fitDist * 1.35;
+      const distance = fitDist * 1.12; // tight margin; scale already +33%
 
-      // Straight-on frontal hero shot (slight elevation only)
-      camera.position.set(0, maxDimLocal * 0.06, distance);
+      camera.position.set(0, maxDimLocal * 0.05, distance);
       DEFAULT_CAM_POS.copy(camera.position);
       controls.minDistance = distance * 0.4;
       controls.maxDistance = distance * 4;
       controls.update();
 
-      // Do NOT run GLB root animation — its pivot is not the visual center,
-      // which is why the angel was orbiting to the right during the spin.
-      // We recreate the 10s ethereal spin on the centered frame instead.
-      mixer = null;
+      // Particles always on with the model
+      particleGroup.visible = true;
+      particlesOn = true;
+      btnParticles.classList.add("active");
 
       statusEl.classList.add("hidden");
     },
@@ -526,38 +515,37 @@
       const ph = phases[i];
       const r = radii[i];
 
-      // Calm float bob
-      const bob = Math.sin(t * 0.35 + ph) * 0.06;
-      // Slow orbital drift in local base space
-      const drift = t * 0.08 + ph;
-      const spin = swirlVelocity * (0.4 + r * 0.08);
-      const cosS = Math.cos(spin * 0.15 + drift * 0.2);
-      const sinS = Math.sin(spin * 0.15 + drift * 0.2);
+      // Calm float bob + idle drift (always alive, even without user input)
+      const bob = Math.sin(t * 0.45 + ph) * 0.08;
+      const drift = t * 0.12 + ph;
+      // Idle swirl + stronger response when user orbits
+      const spin = drift * 0.35 + swirlVelocity * (0.55 + r * 0.1);
+      const cosS = Math.cos(spin * 0.18);
+      const sinS = Math.sin(spin * 0.18);
 
-      // Rotate base XZ by swirl influence (reacts when user orbits)
       let x = bx * cosS - bz * sinS;
       let z = bx * sinS + bz * cosS;
-      let y = by + bob + polarVelocity * 0.25 * Math.sin(ph);
+      let y = by + bob + polarVelocity * 0.35 * Math.sin(ph);
 
-      // Subtle parallax: push particles opposite camera motion in view space
-      const parallax = 0.12 + r * 0.02;
-      x += right.x * swirlVelocity * parallax * 0.15;
-      y += up.y * polarVelocity * parallax * 0.2;
-      z += right.z * swirlVelocity * parallax * 0.15;
+      // Parallax linked to orbit control
+      const parallax = 0.18 + r * 0.03;
+      x += right.x * swirlVelocity * parallax * 0.2;
+      y += up.y * polarVelocity * parallax * 0.25;
+      z += right.z * swirlVelocity * parallax * 0.2;
 
-      // Very soft inward breathing
-      const breathe = 1 + Math.sin(t * 0.25 + ph) * 0.012;
+      // Soft breathing
+      const breathe = 1 + Math.sin(t * 0.32 + ph) * 0.018;
       arr[ix] = x * breathe;
       arr[ix + 1] = y;
       arr[ix + 2] = z * breathe;
     }
     posAttr.needsUpdate = true;
 
-    // Particle group slowly counter-follows azimuth for linked feel
+    // Field gently follows camera orbit
     particleGroup.rotation.y = THREE.MathUtils.damp(
       particleGroup.rotation.y,
-      -spherical.theta * 0.15,
-      2.5,
+      -spherical.theta * 0.2,
+      2.2,
       dt
     );
   }
@@ -571,17 +559,10 @@
     polarVelocity = 0;
   });
 
-  btnAnim.addEventListener("click", () => {
-    animPlaying = !animPlaying;
-    btnAnim.textContent = animPlaying ? "Pause" : "Play";
-    btnAnim.classList.toggle("active", animPlaying);
-  });
-
   btnParticles.addEventListener("click", () => {
     particlesOn = !particlesOn;
     particleGroup.visible = particlesOn;
     btnParticles.classList.toggle("active", particlesOn);
-    btnParticles.textContent = "Particles";
   });
 
   // ---------- Resize ----------
@@ -602,20 +583,7 @@
     const t = clock.elapsedTime;
 
     controls.update();
-
-    // Centered ethereal spin on frame (pivot = body visual center at origin)
-    if (modelFrame && animPlaying) {
-      animTime += dt;
-      const u = (animTime % ANIM_LOOP_SEC) / ANIM_LOOP_SEC; // 0..1
-      const ang = u * Math.PI * 2;
-      modelFrame.rotation.set(
-        Math.sin(ang) * 0.05,
-        ang,
-        Math.sin(ang + 1.0) * 0.035
-      );
-      modelFrame.position.y = Math.sin(ang) * 0.05;
-    }
-
+    // No model rotation — static centered pose
     updateParticles(dt, t);
     composer.render();
   }
