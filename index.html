@@ -350,11 +350,36 @@
   particleGroup.add(particles);
 
   // ---------- Model load ----------
+  // frame: scale + our centered spin (never uses GLB root pivot)
+  // model: geometry offset so body visual center == origin
   let modelRoot = null;
-  let mixer = null;
+  let modelFrame = null;
+  let mixer = null; // unused; kept so Play/Pause UI stays simple
   let animPlaying = true;
   let particlesOn = true;
+  let animTime = 0;
+  const ANIM_LOOP_SEC = 10;
   const clock = new THREE.Clock();
+
+  // Skip far FX that pull the center off-axis / inflate fit distance
+  const FX_RE = /star|shard|link|orbit|presence|tick|cable|rivet|datas/i;
+
+  function bodyBox(root) {
+    const box = new THREE.Box3();
+    let any = false;
+    root.updateMatrixWorld(true);
+    root.traverse((obj) => {
+      if (!obj.isMesh) return;
+      if (FX_RE.test(obj.name)) return;
+      const b = new THREE.Box3().setFromObject(obj);
+      if (!b.isEmpty()) {
+        box.union(b);
+        any = true;
+      }
+    });
+    if (!any) box.setFromObject(root);
+    return box;
+  }
 
   // Track orbit influence for particle reaction
   const spherical = new THREE.Spherical();
@@ -369,7 +394,7 @@
     (gltf) => {
       const model = gltf.scene;
 
-      // Soften any overly harsh materials from export
+      // Soften materials
       model.traverse((obj) => {
         if (obj.isMesh && obj.material) {
           const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
@@ -386,76 +411,65 @@
         }
       });
 
-      // Outer frame = framing/scale (stable). Inner model = animation target.
-      const frame = new THREE.Group();
-      frame.add(model);
-      scene.add(frame);
-      modelRoot = frame;
+      // Reset any export transforms on the scene root before measuring
+      model.position.set(0, 0, 0);
+      model.rotation.set(0, 0, 0);
+      model.scale.set(1, 1, 1);
+      model.updateMatrixWorld(true);
 
-      // Keep spin; drop position tracks so animation can't un-center the figure
-      const clips = (gltf.animations || []).map((clip) => {
-        const c = clip.clone();
-        c.tracks = c.tracks.filter((t) => !t.name.endsWith(".position"));
-        return c;
-      });
-
-      // Far constellation / FX meshes inflate bbox and pull center sideways
-      const exclude = /star|shard|link|orbit|query|presence|tick|cable/i;
-
-      function bodyBox(root) {
-        const box = new THREE.Box3();
-        let any = false;
-        root.updateMatrixWorld(true);
-        root.traverse((obj) => {
-          if (!obj.isMesh) return;
-          if (exclude.test(obj.name)) return;
-          const b = new THREE.Box3().setFromObject(obj);
-          if (!b.isEmpty()) {
-            box.union(b);
-            any = true;
-          }
-        });
-        if (!any) box.setFromObject(root);
-        return box;
-      }
-
-      // Center body on origin under the frame
+      // Measure body center in world space, then offset model so center is (0,0,0)
       let box = bodyBox(model);
       let center = box.getCenter(new THREE.Vector3());
-      model.position.sub(center);
+      model.position.set(-center.x, -center.y, -center.z);
+      model.updateMatrixWorld(true);
 
+      // Second measure after offset (catches nested pivots)
       box = bodyBox(model);
       center = box.getCenter(new THREE.Vector3());
-      model.position.sub(center);
+      model.position.x -= center.x;
+      model.position.y -= center.y;
+      model.position.z -= center.z;
+      model.updateMatrixWorld(true);
 
       box = bodyBox(model);
       const size = box.getSize(new THREE.Vector3());
 
-      // Larger on-page presence
-      frame.scale.setScalar(2.4);
+      // Frame owns scale + centered spin. Spin is applied HERE so pivot is always visual center.
+      const frame = new THREE.Group();
+      frame.add(model);
+      scene.add(frame);
+      modelFrame = frame;
+      modelRoot = frame;
 
-      const targetY = 0;
-      controls.target.set(0, targetY, 0);
-      DEFAULT_TARGET.set(0, targetY, 0);
+      // Fill ~55–60% of the shorter viewport axis
+      const maxDimLocal = Math.max(size.x, size.y, size.z, 0.001);
+      frame.scale.setScalar(1); // size driven by camera distance below
 
-      // Camera distance from body size only (includes frame scale)
-      const maxDim = Math.max(size.x, size.y, size.z, 0.001) * frame.scale.x;
+      // Dead-center target
+      controls.target.set(0, 0, 0);
+      DEFAULT_TARGET.set(0, 0, 0);
+
+      // Fit body to view — front camera on +Z, no lateral offset (that was shifting composition)
       const fov = camera.fov * (Math.PI / 180);
-      const fitDist = maxDim / (2 * Math.tan(fov / 2));
-      const distance = fitDist * 1.2;
+      const aspect = camera.aspect;
+      // Use vertical FOV fit; if wide screen, also consider horizontal
+      const fitH = maxDimLocal / (2 * Math.tan(fov / 2));
+      const fitW = maxDimLocal / (2 * Math.tan(fov / 2) * aspect);
+      const fitDist = Math.max(fitH, fitW);
+      // margin: 1.35 ⇒ body reads large but keeps wing tips in frame
+      const distance = fitDist * 1.35;
 
-      camera.position.set(distance * 0.15, targetY + maxDim * 0.04, distance);
+      // Straight-on frontal hero shot (slight elevation only)
+      camera.position.set(0, maxDimLocal * 0.06, distance);
       DEFAULT_CAM_POS.copy(camera.position);
-      controls.minDistance = distance * 0.45;
-      controls.maxDistance = distance * 3.5;
+      controls.minDistance = distance * 0.4;
+      controls.maxDistance = distance * 4;
       controls.update();
 
-      if (clips.length) {
-        mixer = new THREE.AnimationMixer(model);
-        for (const clip of clips) {
-          mixer.clipAction(clip).play();
-        }
-      }
+      // Do NOT run GLB root animation — its pivot is not the visual center,
+      // which is why the angel was orbiting to the right during the spin.
+      // We recreate the 10s ethereal spin on the centered frame instead.
+      mixer = null;
 
       statusEl.classList.add("hidden");
     },
@@ -561,7 +575,6 @@
     animPlaying = !animPlaying;
     btnAnim.textContent = animPlaying ? "Pause" : "Play";
     btnAnim.classList.toggle("active", animPlaying);
-    if (mixer) mixer.timeScale = animPlaying ? 1 : 0;
   });
 
   btnParticles.addEventListener("click", () => {
@@ -590,15 +603,20 @@
 
     controls.update();
 
-    if (mixer && animPlaying) {
-      mixer.update(dt);
+    // Centered ethereal spin on frame (pivot = body visual center at origin)
+    if (modelFrame && animPlaying) {
+      animTime += dt;
+      const u = (animTime % ANIM_LOOP_SEC) / ANIM_LOOP_SEC; // 0..1
+      const ang = u * Math.PI * 2;
+      modelFrame.rotation.set(
+        Math.sin(ang) * 0.05,
+        ang,
+        Math.sin(ang + 1.0) * 0.035
+      );
+      modelFrame.position.y = Math.sin(ang) * 0.05;
     }
 
     updateParticles(dt, t);
-
-    // Extremely subtle camera breathing (does not fight orbit)
-    // skipped — keep pure user control
-
     composer.render();
   }
 
