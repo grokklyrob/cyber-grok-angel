@@ -166,7 +166,8 @@
    * CONFIG — point this at your GLB
    * Same-folder default works for Vercel + local static servers.
    */
-  const MODEL_URL = "./ethereal_model.glb";
+  // Cache-bust so deploys always pull the intended GLB
+  const MODEL_URL = "./ethereal_model.glb?v=volume-center-1";
 
   import * as THREE from "three";
   import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
@@ -348,30 +349,66 @@
   particleGroup.add(particles);
 
   // ---------- Model load ----------
-  // Static pose: centered, no rotation animation. Particles stay dynamic.
+  // Volume-based centering (export renames meshes; name filters fail).
+  // Static pose only — no mixer, no frame spin. Particles stay dynamic.
   let modelRoot = null;
   let particlesOn = true;
   const clock = new THREE.Clock();
   const ENLARGE = 1.33; // +33%
 
-  // Skip far FX that pull the center off-axis / inflate fit distance
-  const FX_RE = /star|shard|link|orbit|presence|tick|cable|rivet|datas/i;
-
+  /**
+   * Bounding box of the main solid body only.
+   * Tiny constellation shards have tiny volume vs torso/wings — drop them
+   * by volume ratio so we don't depend on mesh names (GLB often uses Cube.NNN).
+   */
   function bodyBox(root) {
-    const box = new THREE.Box3();
-    let any = false;
+    const entries = [];
+    const tmpSize = new THREE.Vector3();
     root.updateMatrixWorld(true);
+
     root.traverse((obj) => {
-      if (!obj.isMesh) return;
-      if (FX_RE.test(obj.name)) return;
+      if (!obj.isMesh || !obj.visible) return;
       const b = new THREE.Box3().setFromObject(obj);
-      if (!b.isEmpty()) {
-        box.union(b);
-        any = true;
-      }
+      if (b.isEmpty()) return;
+      b.getSize(tmpSize);
+      const vol =
+        Math.max(tmpSize.x, 1e-8) *
+        Math.max(tmpSize.y, 1e-8) *
+        Math.max(tmpSize.z, 1e-8);
+      entries.push({ box: b.clone(), vol });
     });
-    if (!any) box.setFromObject(root);
-    return box;
+
+    if (!entries.length) {
+      return new THREE.Box3().setFromObject(root);
+    }
+
+    entries.sort((a, b) => b.vol - a.vol);
+    const maxVol = entries[0].vol;
+    const out = new THREE.Box3();
+    let any = false;
+
+    // Keep meshes that are at least 1.5% of the largest mesh volume
+    for (const e of entries) {
+      if (e.vol < maxVol * 0.015) continue;
+      out.union(e.box);
+      any = true;
+    }
+
+    // Fallback: top quartile by volume
+    if (!any || out.isEmpty()) {
+      const n = Math.max(1, Math.ceil(entries.length * 0.25));
+      for (let i = 0; i < n; i++) out.union(entries[i].box);
+    }
+    return out;
+  }
+
+  function freezeStatic(root) {
+    root.position.set(0, 0, 0);
+    root.rotation.set(0, 0, 0);
+    root.quaternion.identity();
+    root.scale.set(1, 1, 1);
+    // Do not zero child mesh rotations (those are modeling offsets).
+    // Just ensure nothing will be driven by animation.
   }
 
   // Track orbit influence for particle reaction
@@ -385,7 +422,11 @@
   loader.load(
     MODEL_URL,
     (gltf) => {
+      // Explicitly ignore all baked clips — no AnimationMixer, ever
+      gltf.animations = [];
+
       const model = gltf.scene;
+      freezeStatic(model);
 
       // Soften materials
       model.traverse((obj) => {
@@ -404,13 +445,9 @@
         }
       });
 
-      // Static pose — freeze any baked animation at rest
-      model.position.set(0, 0, 0);
-      model.rotation.set(0, 0, 0);
-      model.scale.set(1, 1, 1);
       model.updateMatrixWorld(true);
 
-      // Center body at origin
+      // --- Volume-center the body on origin (double pass) ---
       let box = bodyBox(model);
       let center = box.getCenter(new THREE.Vector3());
       model.position.set(-center.x, -center.y, -center.z);
@@ -425,37 +462,80 @@
 
       box = bodyBox(model);
       const size = box.getSize(new THREE.Vector3());
+      const bodyRadius = 0.5 * Math.max(size.x, size.y, size.z, 0.001);
+
+      // Hide far micro-FX still hanging off the body (tiny volume already ignored for fit,
+      // but long thin links can still draw off to one side visually)
+      const far = new THREE.Vector3();
+      model.traverse((obj) => {
+        if (!obj.isMesh) return;
+        const b = new THREE.Box3().setFromObject(obj);
+        if (b.isEmpty()) return;
+        b.getCenter(far);
+        const s = b.getSize(new THREE.Vector3());
+        const vol = Math.max(s.x, 1e-8) * Math.max(s.y, 1e-8) * Math.max(s.z, 1e-8);
+        const maxBodyVol = size.x * size.y * size.z;
+        // Far + tiny → hide (constellation crumbs)
+        if (far.length() > bodyRadius * 1.65 && vol < maxBodyVol * 0.002) {
+          obj.visible = false;
+        }
+      });
+
+      // Re-measure after hiding crumbs
+      box = bodyBox(model);
+      center = box.getCenter(new THREE.Vector3());
+      model.position.x -= center.x;
+      model.position.y -= center.y;
+      model.position.z -= center.z;
+      model.updateMatrixWorld(true);
+
+      box = bodyBox(model);
+      const finalSize = box.getSize(new THREE.Vector3());
+      // Final verify: body center must be ~origin
+      const finalCenter = box.getCenter(new THREE.Vector3());
+      if (finalCenter.length() > 0.02) {
+        model.position.x -= finalCenter.x;
+        model.position.y -= finalCenter.y;
+        model.position.z -= finalCenter.z;
+        model.updateMatrixWorld(true);
+        box = bodyBox(model);
+        finalSize.copy(box.getSize(new THREE.Vector3()));
+      }
 
       const frame = new THREE.Group();
       frame.add(model);
+      frame.position.set(0, 0, 0);
+      frame.rotation.set(0, 0, 0);
+      frame.quaternion.identity();
+      frame.scale.setScalar(ENLARGE);
       scene.add(frame);
       modelRoot = frame;
 
-      // +33% larger than fit-to-view baseline
-      frame.scale.setScalar(ENLARGE);
-      frame.rotation.set(0, 0, 0);
-      frame.position.set(0, 0, 0);
+      const maxDim = Math.max(finalSize.x, finalSize.y, finalSize.z, 0.001) * ENLARGE;
 
-      const maxDimLocal = Math.max(size.x, size.y, size.z, 0.001) * ENLARGE;
-
+      // Dead-center orbit target
       controls.target.set(0, 0, 0);
       DEFAULT_TARGET.set(0, 0, 0);
+      controls.autoRotate = false;
 
-      // Front camera, dead center — no lateral offset, no model spin
+      // Front camera on +Z only — never offset X (that shifts composition)
       const fov = camera.fov * (Math.PI / 180);
-      const aspect = camera.aspect;
-      const fitH = maxDimLocal / (2 * Math.tan(fov / 2));
-      const fitW = maxDimLocal / (2 * Math.tan(fov / 2) * aspect);
+      const aspect = Math.max(camera.aspect, 0.01);
+      const fitH = maxDim / (2 * Math.tan(fov / 2));
+      const fitW = maxDim / (2 * Math.tan(fov / 2) * aspect);
       const fitDist = Math.max(fitH, fitW);
-      const distance = fitDist * 1.12; // tight margin; scale already +33%
+      // Tight margin; ENLARGE already +33%
+      const distance = fitDist * 1.08;
 
-      camera.position.set(0, maxDimLocal * 0.05, distance);
+      camera.position.set(0, maxDim * 0.04, distance);
       DEFAULT_CAM_POS.copy(camera.position);
-      controls.minDistance = distance * 0.4;
+      controls.minDistance = distance * 0.35;
       controls.maxDistance = distance * 4;
       controls.update();
 
-      // Particles always on with the model
+      // Particles on, field centered on origin with the model
+      particleGroup.position.set(0, 0, 0);
+      particleGroup.rotation.set(0, 0, 0);
       particleGroup.visible = true;
       particlesOn = true;
       btnParticles.classList.add("active");
@@ -583,7 +663,17 @@
     const t = clock.elapsedTime;
 
     controls.update();
-    // No model rotation — static centered pose
+
+    // HARD FREEZE model — never rotate/translate after load
+    if (modelRoot) {
+      modelRoot.rotation.set(0, 0, 0);
+      modelRoot.quaternion.identity();
+      // keep only Y=0 bob-free; position stays at origin
+      modelRoot.position.x = 0;
+      modelRoot.position.y = 0;
+      modelRoot.position.z = 0;
+    }
+
     updateParticles(dt, t);
     composer.render();
   }
